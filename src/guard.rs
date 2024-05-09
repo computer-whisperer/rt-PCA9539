@@ -5,39 +5,43 @@
 use crate::expander::PCA9539;
 use core::cell::RefCell;
 use core::ops::DerefMut;
-use embedded_hal::blocking::i2c::{Read, Write};
+use embedded_hal::digital::OutputPin;
+use embedded_hal_async::i2c::I2c;
 
 /// Manages the access of pins to expander reference
-pub trait RefGuard<B>
+pub trait RefGuard<B, RESET>
 where
-    B: Write + Read<u8>,
+    B: I2c,
+    RESET: OutputPin,
 {
     fn access<F>(&self, f: F)
     where
-        F: FnMut(&mut PCA9539<B>);
+        F: FnMut(&mut PCA9539<B, RESET>);
 }
 
 /// Guard which is neither Send or Sync, but is the most efficient
-pub struct LockFreeGuard<'a, B>
+pub struct LockFreeGuard<'a, B, RESET>
 where
-    B: Write + Read,
+    B: I2c,
+    RESET: OutputPin
 {
-    expander: RefCell<&'a mut PCA9539<B>>,
+    expander: RefCell<&'a mut PCA9539<B, RESET>>,
 }
 
-impl<'a, B: Write + Read> LockFreeGuard<'a, B> {
-    pub fn new(expander: RefCell<&'a mut PCA9539<B>>) -> Self {
+impl<'a, B: I2c, RESET: OutputPin> LockFreeGuard<'a, B, RESET> {
+    pub fn new(expander: RefCell<&'a mut PCA9539<B, RESET>>) -> Self {
         LockFreeGuard { expander }
     }
 }
 
-impl<'a, B> RefGuard<B> for LockFreeGuard<'a, B>
+impl<'a, B, RESET> RefGuard<B, RESET> for LockFreeGuard<'a, B, RESET>
 where
-    B: Write + Read<u8>,
+    B: I2c,
+    RESET: OutputPin
 {
     fn access<F>(&self, mut f: F)
     where
-        F: FnMut(&mut PCA9539<B>),
+        F: FnMut(&mut PCA9539<B, RESET>),
     {
         f(self.expander.borrow_mut().deref_mut());
     }

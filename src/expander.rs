@@ -94,7 +94,8 @@ use core::cell::RefCell;
 use core::fmt::{Debug, Formatter};
 #[cfg(feature = "cortex-m")]
 use cortex_m::interrupt::Mutex as CsMutex;
-use embedded_hal::blocking::i2c::{Read, SevenBitAddress, Write};
+use embedded_hal::i2c::{SevenBitAddress};
+use embedded_hal_async::i2c::I2c;
 use heapless::String;
 #[cfg(feature = "spin")]
 use spin::Mutex as SpinMutex;
@@ -127,9 +128,10 @@ pub enum Mode {
 }
 
 /// Abstraction of [PCA9539](<https://www.ti.com/lit/ds/symlink/pca9539.pdf?ts=1649342250975>) I/O expander
-pub struct PCA9539<B>
+pub struct PCA9539<B, RESET>
 where
-    B: Write<SevenBitAddress> + Read<SevenBitAddress>,
+    B: I2c<SevenBitAddress>,
+    RESET: embedded_hal::digital::OutputPin
 {
     bus: B,
 
@@ -140,6 +142,8 @@ where
     ///  H  L => 0x76 (hexadecimal)
     ///  H  H => 0x77 (hexadecimal)
     address: u8,
+
+    reset_pin: RESET,
 
     /// First input register
     input_0: Bitmap<8>,
@@ -164,9 +168,16 @@ where
 
 /// Wrapped I2C error when refreshing input state
 /// Reading input state consists of one write, followed by a read operation
-pub enum RefreshInputError<B: Write + Read<u8>> {
-    WriteError(<B as Write>::Error),
-    ReadError(<B as Read>::Error),
+pub enum RefreshInputError<B: I2c> {
+    WriteError(B::Error),
+    ReadError(B::Error),
+    I2cError(B::Error)
+}
+
+impl<B: I2c> embedded_hal::digital::Error for RefreshInputError<B> {
+    fn kind(&self) -> embedded_hal::digital::ErrorKind {
+        embedded_hal::digital::ErrorKind::Other
+    }
 }
 
 const COMMAND_INPUT_0: u8 = 0x00;
@@ -181,14 +192,16 @@ const COMMAND_POLARITY_1: u8 = 0x05;
 const COMMAND_CONF_0: u8 = 0x06;
 const COMMAND_CONF_1: u8 = 0x07;
 
-impl<B> PCA9539<B>
+impl<B, RESET> PCA9539<B, RESET>
 where
-    B: Write<SevenBitAddress> + Read<SevenBitAddress>,
+    B: I2c<SevenBitAddress>,
+    RESET: embedded_hal::digital::OutputPin
 {
-    pub fn new(bus: B, address: u8) -> Self {
+    pub async fn new(bus: B, address: u8, reset_pin: RESET) -> Self {
         let mut expander = Self {
             bus,
             address,
+            reset_pin,
             input_0: Bitmap::<8>::new(),
             input_1: Bitmap::<8>::new(),
             output_0: Bitmap::<8>::new(),
@@ -198,6 +211,8 @@ where
             configuration_0: Bitmap::<8>::new(),
             configuration_1: Bitmap::<8>::new(),
         };
+
+        expander.reset_pin.set_high().unwrap();
 
         expander.output_0.invert();
         expander.output_1.invert();
@@ -211,7 +226,7 @@ where
     /// This is the most efficient way of using individual pins
     /// The downside is, that these pins are neither Send or Sync, so can only be used in single-threaded
     /// and interrupt-free applications
-    pub fn pins(&mut self) -> Pins<B, LockFreeGuard<B>> {
+    pub fn pins(&mut self) -> Pins<B, RESET, LockFreeGuard<B, RESET>> {
         Pins::new(LockFreeGuard::new(RefCell::new(self)))
     }
 
@@ -232,16 +247,16 @@ where
     }
 
     /// Switches the given pin to the input/output mode by adjusting the configuration register
-    pub fn set_mode(&mut self, bank: Bank, id: PinID, mode: Mode) -> Result<(), <B as Write>::Error> {
+    pub async fn set_mode(&mut self, bank: Bank, id: PinID, mode: Mode) -> Result<(), B::Error> {
         match bank {
             Bank::Bank0 => self.configuration_0.set(id as usize, mode.into()),
             Bank::Bank1 => self.configuration_1.set(id as usize, mode.into()),
         };
-        self.write_conf(bank)
+        self.write_conf(bank).await
     }
 
     /// Switches all pins of the given bank to output/input mode1
-    pub fn set_mode_all(&mut self, bank: Bank, mode: Mode) -> Result<(), <B as Write>::Error> {
+    pub async fn set_mode_all(&mut self, bank: Bank, mode: Mode) -> Result<(), B::Error> {
         let mut bitset = Bitmap::<8>::new();
 
         if mode == Mode::Input {
@@ -252,7 +267,7 @@ where
             Bank::Bank0 => self.configuration_0 = bitset,
             Bank::Bank1 => self.configuration_1 = bitset,
         };
-        self.write_conf(bank)
+        self.write_conf(bank).await
     }
 
     /// Sets the given output state by adjusting the output register
@@ -267,7 +282,7 @@ where
     }
 
     /// Sets output state for all pins of a bank
-    pub fn set_state_all(&mut self, bank: Bank, is_high: bool) -> Result<(), <B as Write>::Error> {
+    pub async fn set_state_all(&mut self, bank: Bank, is_high: bool) -> Result<(), B::Error> {
         let mut bitset = Bitmap::<8>::new();
 
         if is_high {
@@ -278,23 +293,23 @@ where
             Bank::Bank0 => self.output_0 = bitset,
             Bank::Bank1 => self.output_1 = bitset,
         };
-        self.write_output_state(bank)
+        self.write_output_state(bank).await
     }
 
     /// Reveres/Resets the input polarity of the given pin
-    pub fn reverse_polarity(&mut self, bank: Bank, id: PinID, reversed: bool) -> Result<(), <B as Write>::Error> {
+    pub async fn reverse_polarity(&mut self, bank: Bank, id: PinID, reversed: bool) -> Result<(), B::Error> {
         match bank {
             Bank::Bank0 => self.polarity_0.set(id as usize, reversed),
             Bank::Bank1 => self.polarity_1.set(id as usize, reversed),
         };
-        self.write_polarity(bank)
+        self.write_polarity(bank).await
     }
 
     /// Refreshes the input state of the given bank
-    pub fn refresh_input_state(&mut self, bank: Bank) -> Result<(), RefreshInputError<B>> {
+    pub async fn refresh_input_state(&mut self, bank: Bank) -> Result<(), RefreshInputError<B>> {
         match bank {
-            Bank::Bank0 => self.input_0 = Bitmap::from_value(self.read_input_register(COMMAND_INPUT_0)?),
-            Bank::Bank1 => self.input_1 = Bitmap::from_value(self.read_input_register(COMMAND_INPUT_1)?),
+            Bank::Bank0 => self.input_0 = Bitmap::from_value(self.read_input_register(COMMAND_INPUT_0).await?),
+            Bank::Bank1 => self.input_1 = Bitmap::from_value(self.read_input_register(COMMAND_INPUT_1).await?),
         };
 
         Ok(())
@@ -320,42 +335,37 @@ where
     }
 
     /// Reads and returns the given input register
-    fn read_input_register(&mut self, command: u8) -> Result<u8, RefreshInputError<B>> {
-        self.bus
-            .write(self.address, &[command])
-            .map_err(RefreshInputError::WriteError)?;
-
+    async fn read_input_register(&mut self, command: u8) -> Result<u8, RefreshInputError<B>> {
         let mut buffer: [u8; 1] = [0x0; 1];
-        self.bus.read(self.address, &mut buffer).map_err(RefreshInputError::ReadError)?;
-
+        self.bus.write_read(self.address, &[command], &mut buffer).await.map_err(RefreshInputError::I2cError)?;
         Ok(buffer[0])
     }
 
     /// Writes the configuration register of the given bank
-    fn write_conf(&mut self, bank: Bank) -> Result<(), <B as Write>::Error> {
+    async fn write_conf(&mut self, bank: Bank) -> Result<(), B::Error> {
         match bank {
             Bank::Bank0 => self
                 .bus
-                .write(self.address, &[COMMAND_CONF_0, *self.configuration_0.as_value()]),
+                .write(self.address, &[COMMAND_CONF_0, *self.configuration_0.as_value()]).await,
             Bank::Bank1 => self
                 .bus
-                .write(self.address, &[COMMAND_CONF_1, *self.configuration_1.as_value()]),
+                .write(self.address, &[COMMAND_CONF_1, *self.configuration_1.as_value()]).await,
         }
     }
 
     /// Writes the output register of the given bank
-    pub fn write_output_state(&mut self, bank: Bank) -> Result<(), <B as Write>::Error> {
+    pub async fn write_output_state(&mut self, bank: Bank) -> Result<(), B::Error> {
         match bank {
-            Bank::Bank0 => self.bus.write(self.address, &[COMMAND_OUTPUT_0, *self.output_0.as_value()]),
-            Bank::Bank1 => self.bus.write(self.address, &[COMMAND_OUTPUT_1, *self.output_1.as_value()]),
+            Bank::Bank0 => self.bus.write(self.address, &[COMMAND_OUTPUT_0, *self.output_0.as_value()]).await,
+            Bank::Bank1 => self.bus.write(self.address, &[COMMAND_OUTPUT_1, *self.output_1.as_value()]).await,
         }
     }
 
     /// Writes the polarity register of the given bank
-    fn write_polarity(&mut self, bank: Bank) -> Result<(), <B as Write>::Error> {
+    async fn write_polarity(&mut self, bank: Bank) -> Result<(), B::Error> {
         match bank {
-            Bank::Bank0 => self.bus.write(self.address, &[COMMAND_POLARITY_0, *self.polarity_0.as_value()]),
-            Bank::Bank1 => self.bus.write(self.address, &[COMMAND_POLARITY_1, *self.polarity_1.as_value()]),
+            Bank::Bank0 => self.bus.write(self.address, &[COMMAND_POLARITY_0, *self.polarity_0.as_value()]).await,
+            Bank::Bank1 => self.bus.write(self.address, &[COMMAND_POLARITY_1, *self.polarity_1.as_value()]).await,
         }
     }
 }
@@ -369,20 +379,22 @@ impl From<Mode> for bool {
     }
 }
 
-impl<B: Read<u8> + Write> Debug for RefreshInputError<B> {
+impl<B: I2c> Debug for RefreshInputError<B> {
     fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         match self {
             RefreshInputError::WriteError(_) => f.write_str("RefreshInputError::WriteError"),
             RefreshInputError::ReadError(_) => f.write_str("RefreshInputError::ReadError"),
+            RefreshInputError::I2cError(_) => f.write_str("RefreshInputError::I2cError"),
         }
     }
 }
 
-impl<B: Read<u8> + Write> RefreshInputError<B> {
+impl<B: I2c> RefreshInputError<B> {
     pub fn to_string(&self) -> String<10> {
         match self {
             RefreshInputError::WriteError(_) => String::try_from("WriteError").unwrap(),
             RefreshInputError::ReadError(_) => String::try_from("ReadError").unwrap(),
+            RefreshInputError::I2cError(_) => String::try_from("I2cError").unwrap(),
         }
     }
 }

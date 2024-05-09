@@ -161,27 +161,30 @@
 use crate::expander::{Bank, Mode, PinID};
 use crate::guard::RefGuard;
 use core::marker::PhantomData;
-use embedded_hal::blocking::i2c::{Read, Write};
+use embedded_hal::digital::OutputPin;
+use embedded_hal_async::i2c::I2c;
 
 pub use crate::pin_refreshable::{RefreshableInputPin, RefreshableOutputPin};
 
 /// Container for fetching individual pins
-pub struct Pins<B: Write + Read, R: RefGuard<B>> {
+pub struct Pins<B: I2c, RESET: OutputPin, R: RefGuard<B, RESET>> {
     guard: R,
     bus: PhantomData<fn(B) -> B>,
+    reset: PhantomData<fn(RESET) -> RESET>,
 }
 
-impl<B: Write + Read, R: RefGuard<B>> Pins<B, R> {
+impl<B: I2c, RESET: OutputPin, R: RefGuard<B, RESET>> Pins<B, RESET, R> {
     pub fn new(guard: R) -> Self {
         Self {
             guard,
             bus: PhantomData,
+            reset: PhantomData,
         }
     }
 
     /// Returns an individual pin, which state gets updated synchronously
     /// **The library does not prevent multiple parallel instances of the same pin.**
-    pub fn get_pin(&self, bank: Bank, id: PinID) -> Pin<B, R, Input, RegularAccessMode> {
+    pub fn get_pin(&self, bank: Bank, id: PinID) -> Pin<B, RESET, R, Input, RegularAccessMode> {
         Pin::regular(&self.guard, bank, id)
     }
 
@@ -189,7 +192,7 @@ impl<B: Write + Read, R: RefGuard<B>> Pins<B, R> {
     /// The status is explicitly updated. This allows a more efficient status query and assignment,
     /// as the status is only updated once for all pins.
     /// **The library does not prevent multiple parallel instances of the same pin.**
-    pub fn get_refreshable_pin(&self, bank: Bank, id: PinID) -> Pin<B, R, Input, RefreshMode> {
+    pub fn get_refreshable_pin(&self, bank: Bank, id: PinID) -> Pin<B, RESET, R, Input, RefreshMode> {
         Pin::refreshable(&self.guard, bank, id)
     }
 }
@@ -222,10 +225,11 @@ pub struct Output {}
 impl PinMode for Output {}
 
 /// Individual GPIO pin
-pub struct Pin<'a, B, R, M, A>
+pub struct Pin<'a, B, RESET, R, M, A>
 where
-    B: Write + Read,
-    R: RefGuard<B>,
+    B: I2c,
+    RESET: OutputPin,
+    R: RefGuard<B, RESET>,
     M: PinMode,
     A: AccessMode,
 {
@@ -236,30 +240,34 @@ where
     pub(crate) bus: PhantomData<fn(B) -> B>,
     pub(crate) mode: PhantomData<M>,
     pub(crate) access_mode: PhantomData<A>,
+    pub(crate) reset: PhantomData<RESET>,
 }
 
-impl<'a, B, R, A> Pin<'a, B, R, Input, A>
+impl<'a, B, RESET, R, A> Pin<'a, B, RESET, R, Input, A>
 where
-    B: Write + Read,
-    R: RefGuard<B>,
+    B: I2c,
+    RESET: OutputPin,
+    R: RefGuard<B, RESET>,
     A: AccessMode,
 {
     /// Reverses/Resets the input polarity
-    pub fn invert_polarity(&self, invert: bool) -> Result<(), <B as Write>::Error> {
+    pub fn invert_polarity(&self, invert: bool) -> Result<(), B::Error> {
         let mut result = Ok(());
 
         self.expander.access(|expander| {
-            result = expander.reverse_polarity(self.bank, self.id, invert);
+            let fut = expander.reverse_polarity(self.bank, self.id, invert);
+            result = embassy_futures::block_on(fut);
         });
 
         result
     }
 }
 
-impl<'a, B, R, A> Pin<'a, B, R, Output, A>
+impl<'a, B, RESET, R, A> Pin<'a, B, RESET, R, Output, A>
 where
-    B: Write + Read,
-    R: RefGuard<B>,
+    B: I2c,
+    RESET: OutputPin,
+    R: RefGuard<B, RESET>,
     A: AccessMode,
 {
     /// Returns the current output state, this logic is independent from access mode, as it acts in both
@@ -273,19 +281,21 @@ where
     }
 }
 
-impl<'a, B, M, R, A> Pin<'a, B, R, M, A>
+impl<'a, B, RESET, M, R, A> Pin<'a, B, RESET, R, M, A>
 where
-    B: Write + Read,
-    R: RefGuard<B>,
+    B: I2c,
+    RESET: OutputPin,
+    R: RefGuard<B, RESET>,
     M: PinMode,
     A: AccessMode,
 {
     /// Switches the pin to the given mode
-    pub(crate) fn change_mode(&self, mode: Mode) -> Result<(), <B as Write>::Error> {
+    pub(crate) fn change_mode(&self, mode: Mode) -> Result<(), B::Error> {
         let mut result = Ok(());
 
         self.expander.access(|expander| {
-            result = expander.set_mode(self.bank, self.id, mode);
+            let fut = expander.set_mode(self.bank, self.id, mode);
+            result = embassy_futures::block_on(fut);
         });
 
         result
