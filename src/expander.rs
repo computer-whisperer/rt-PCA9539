@@ -180,6 +180,8 @@ impl<B: I2c> embedded_hal::digital::Error for RefreshInputError<B> {
     }
 }
 
+impl<B: I2c> crate::digital_hal_async::Error for RefreshInputError<B> {}
+
 const COMMAND_INPUT_0: u8 = 0x00;
 const COMMAND_INPUT_1: u8 = 0x01;
 
@@ -220,14 +222,6 @@ where
         expander.configuration_1.invert();
 
         expander
-    }
-
-    /// Returns a pins container without using any locks
-    /// This is the most efficient way of using individual pins
-    /// The downside is, that these pins are neither Send or Sync, so can only be used in single-threaded
-    /// and interrupt-free applications
-    pub fn pins(&mut self) -> Pins<B, RESET, LockFreeGuard<B, RESET>> {
-        Pins::new(LockFreeGuard::new(RefCell::new(self)))
     }
 
     /// Returns a pins container using Mutex based on critical sections

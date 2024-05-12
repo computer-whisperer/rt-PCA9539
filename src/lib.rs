@@ -31,6 +31,7 @@ extern crate embedded_hal;
 pub mod expander;
 pub mod guard;
 pub mod pins;
+pub mod digital_hal_async;
 
 pub(crate) mod pin_refreshable;
 pub(crate) mod pin_regular;

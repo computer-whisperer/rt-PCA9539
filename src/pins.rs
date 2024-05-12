@@ -158,42 +158,40 @@
 //!# #[cfg(feature = "spin")]
 //! let pins = expander.pins_spin_mutex();
 //! ```
-use crate::expander::{Bank, Mode, PinID};
+use crate::expander::{Bank, Mode, PCA9539, PinID};
 use crate::guard::RefGuard;
 use core::marker::PhantomData;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::i2c::I2c;
+use embassy_sync::mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::RawMutex;
 
 pub use crate::pin_refreshable::{RefreshableInputPin, RefreshableOutputPin};
 
 /// Container for fetching individual pins
-pub struct Pins<B: I2c, RESET: OutputPin, R: RefGuard<B, RESET>> {
-    guard: R,
-    bus: PhantomData<fn(B) -> B>,
-    reset: PhantomData<fn(RESET) -> RESET>,
+pub struct Pins<'a, I2CT: I2c, RESET: OutputPin, RAWMUTEX: RawMutex> {
+    expander: &'a Mutex<RAWMUTEX, Option<PCA9539<I2CT, RESET>>>
 }
 
-impl<B: I2c, RESET: OutputPin, R: RefGuard<B, RESET>> Pins<B, RESET, R> {
-    pub fn new(guard: R) -> Self {
+impl<'a, I2CT: I2c, RESET: OutputPin, RAWMUTEX: RawMutex> Pins<'a, I2CT, RESET, RAWMUTEX> {
+    pub fn new(expander: &'a Mutex<RAWMUTEX, Option<PCA9539<I2CT, RESET>>>) -> Self {
         Self {
-            guard,
-            bus: PhantomData,
-            reset: PhantomData,
+            expander
         }
     }
 
     /// Returns an individual pin, which state gets updated synchronously
     /// **The library does not prevent multiple parallel instances of the same pin.**
-    pub fn get_pin(&self, bank: Bank, id: PinID) -> Pin<B, RESET, R, Input, RegularAccessMode> {
-        Pin::regular(&self.guard, bank, id)
+    pub fn get_pin(&self, bank: Bank, id: PinID) -> Pin<'a, I2CT, RESET, RAWMUTEX, Input, RegularAccessMode> {
+        Pin::regular(self.expander, bank, id)
     }
 
     /// Returns an individual pin, which is using a cached state
     /// The status is explicitly updated. This allows a more efficient status query and assignment,
     /// as the status is only updated once for all pins.
     /// **The library does not prevent multiple parallel instances of the same pin.**
-    pub fn get_refreshable_pin(&self, bank: Bank, id: PinID) -> Pin<B, RESET, R, Input, RefreshMode> {
-        Pin::refreshable(&self.guard, bank, id)
+    pub fn get_refreshable_pin(&self, bank: Bank, id: PinID) -> Pin<'a, I2CT, RESET, RAWMUTEX, Input, RefreshMode> {
+        Pin::refreshable(self.expander, bank, id)
     }
 }
 
@@ -225,79 +223,59 @@ pub struct Output {}
 impl PinMode for Output {}
 
 /// Individual GPIO pin
-pub struct Pin<'a, B, RESET, R, M, A>
+pub struct Pin<'a, I2CT, RESET, RAWMUTEX, MODE, ACCESS>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
-    M: PinMode,
-    A: AccessMode,
+    RAWMUTEX: RawMutex,
+    MODE: PinMode,
+    ACCESS: AccessMode,
 {
-    pub(crate) expander: &'a R,
+    pub(crate) expander: &'a Mutex<RAWMUTEX, Option<PCA9539<I2CT, RESET>>>,
     pub(crate) bank: Bank,
     pub(crate) id: PinID,
-
-    pub(crate) bus: PhantomData<fn(B) -> B>,
-    pub(crate) mode: PhantomData<M>,
-    pub(crate) access_mode: PhantomData<A>,
+    pub(crate) mode: PhantomData<MODE>,
+    pub(crate) access_mode: PhantomData<ACCESS>,
     pub(crate) reset: PhantomData<RESET>,
 }
 
-impl<'a, B, RESET, R, A> Pin<'a, B, RESET, R, Input, A>
+impl<'a, I2CT, RESET, RAWMUTEX, ACCESS> Pin<'a, I2CT, RESET, RAWMUTEX, Input, ACCESS>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
-    A: AccessMode,
+    RAWMUTEX: RawMutex,
+    ACCESS: AccessMode,
 {
     /// Reverses/Resets the input polarity
-    pub fn invert_polarity(&self, invert: bool) -> Result<(), B::Error> {
-        let mut result = Ok(());
-
-        self.expander.access(|expander| {
-            let fut = expander.reverse_polarity(self.bank, self.id, invert);
-            result = embassy_futures::block_on(fut);
-        });
-
-        result
+    pub async fn invert_polarity(&self, invert: bool) -> Result<(), I2CT::Error> {
+        self.expander.lock().await.as_mut().unwrap().reverse_polarity(self.bank, self.id, invert).await
     }
 }
 
-impl<'a, B, RESET, R, A> Pin<'a, B, RESET, R, Output, A>
+impl<'a, I2CT, RESET, RAWMUTEX, ACCESS> Pin<'a, I2CT, RESET, RAWMUTEX, Output, ACCESS>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
-    A: AccessMode,
+    RAWMUTEX: RawMutex,
+    ACCESS: AccessMode,
 {
     /// Returns the current output state, this logic is independent from access mode, as it acts in both
     /// cases on cached register state
-    pub(crate) fn is_pin_output_high(&self) -> bool {
-        let mut is_high = false;
-        self.expander
-            .access(|expander| is_high = expander.is_pin_output_high(self.bank, self.id));
-
-        is_high
+    pub(crate) async fn is_pin_output_high(&self) -> bool {
+        self.expander.lock().await.as_mut().unwrap().is_pin_output_high(self.bank, self.id)
     }
 }
 
-impl<'a, B, RESET, M, R, A> Pin<'a, B, RESET, R, M, A>
+impl<'a, I2CT, RESET, RAWMUTEX, MODE, ACCESS> Pin<'a, I2CT, RESET, RAWMUTEX, MODE, ACCESS>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
-    M: PinMode,
-    A: AccessMode,
+    RAWMUTEX: RawMutex,
+    ACCESS: AccessMode,
+    MODE: PinMode,
 {
     /// Switches the pin to the given mode
-    pub(crate) fn change_mode(&self, mode: Mode) -> Result<(), B::Error> {
-        let mut result = Ok(());
-
-        self.expander.access(|expander| {
-            let fut = expander.set_mode(self.bank, self.id, mode);
-            result = embassy_futures::block_on(fut);
-        });
-
-        result
+    pub(crate) async fn change_mode(&self, mode: Mode) -> Result<(), I2CT::Error> {
+        self.expander.lock().await.as_mut().unwrap().set_mode(self.bank, self.id, mode).await
     }
 }

@@ -1,20 +1,25 @@
-use crate::expander::{Bank, Mode, PinID, RefreshInputError};
-use crate::guard::RefGuard;
+use crate::expander::{PCA9539, Bank, Mode, PinID, RefreshInputError};
 use crate::pins::{Input, Output, Pin, RefreshMode};
 use core::convert::Infallible;
 use core::marker::PhantomData;
 use embedded_hal_async::i2c::I2c;
-use embedded_hal::digital::{ErrorType, InputPin, OutputPin, PinState, StatefulOutputPin};
+use embedded_hal::digital::{InputPin, OutputPin, PinState, StatefulOutputPin};
+use embedded_hal::digital;
+use embassy_sync::mutex::Mutex;
+use embassy_sync::blocking_mutex::raw::RawMutex;
+use crate::digital_hal_async::{InputPinAsync, OutputPinAsync};
+use crate::digital_hal_async;
+
 
 /// Trait for refreshable pins in output mode
 pub trait RefreshableOutputPin {
     type Error;
 
     /// Updates the output state of all pins of the same bank
-    fn update_bank(&self) -> Result<(), Self::Error>;
+    async fn update_bank(&self) -> Result<(), Self::Error>;
 
     /// Updates the output state of all pins (on all banks)
-    fn update_all(&self) -> Result<(), Self::Error>;
+    async fn update_all(&self) -> Result<(), Self::Error>;
 }
 
 /// Trait for refreshable pins in input mode
@@ -22,22 +27,21 @@ pub trait RefreshableInputPin {
     type Error;
 
     /// Refreshes the input state of all pins of the same bank
-    fn refresh_bank(&self) -> Result<(), Self::Error>;
+    async fn refresh_bank(&self) -> Result<(), Self::Error>;
 
     /// Refreshes the input state of all pins (on all banks)
-    fn refresh_all(&self) -> Result<(), Self::Error>;
+    async fn refresh_all(&self) -> Result<(), Self::Error>;
 }
 
-impl<'a, B, RESET, R> Pin<'a, B,  RESET, R, Input, RefreshMode>
+impl<'a, I2CT, RESET, RAWMUTEX> Pin<'a, I2CT, RESET, RAWMUTEX, Input, RefreshMode>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
+    RAWMUTEX: RawMutex,
 {
-    pub fn refreshable(expander: &'a R, bank: Bank, id: PinID) -> Self {
+    pub fn refreshable(expander: &'a Mutex<RAWMUTEX, Option<PCA9539<I2CT, RESET>>>, bank: Bank, id: PinID) -> Self {
         Self {
             expander,
-            bus: PhantomData,
             reset: PhantomData,
             bank,
             id,
@@ -47,132 +51,140 @@ where
     }
 
     /// Refreshes the input state of the given bank
-    fn refresh(&self, bank: Bank) -> Result<(), RefreshInputError<B>> {
-        let mut result = Ok(());
-
-        self.expander.access(|expander| {
-            let fut = expander.refresh_input_state(bank);
-            result = embassy_futures::block_on(fut);
-        });
-
-        result
+    async fn refresh(&self, bank: Bank) -> Result<(), RefreshInputError<I2CT>> {
+        let mut expander = self.expander.lock().await;
+        expander.as_mut().unwrap().refresh_input_state(bank).await
     }
 
-    pub fn into_input_pin(self) -> Result<Pin<'a, B, RESET, R, Input, RefreshMode>, B::Error> {
-        self.change_mode(Mode::Input)?;
+    pub async fn into_input_pin(self) -> Result<Pin<'a, I2CT, RESET, RAWMUTEX, Input, RefreshMode>, I2CT::Error> {
+        self.change_mode(Mode::Input).await?;
 
         Ok(Pin {
             expander: self.expander,
             bank: self.bank,
             id: self.id,
-            bus: PhantomData,
             mode: PhantomData,
             access_mode: PhantomData,
             reset: PhantomData
         })
     }
 
-    pub fn into_output_pin(self, state: PinState) -> Result<Pin<'a, B, RESET, R, Output, RefreshMode>, B::Error> {
-        self.change_mode(Mode::Output)?;
+    pub async fn into_output_pin(self, state: PinState) -> Result<Pin<'a, I2CT, RESET, RAWMUTEX, Output, RefreshMode>, I2CT::Error> {
+        self.change_mode(Mode::Output).await?;
 
         let mut pin = Pin {
             expander: self.expander,
             bank: self.bank,
             id: self.id,
-            bus: PhantomData,
             mode: PhantomData,
             access_mode: PhantomData,
             reset: PhantomData
         };
 
-        let _ = pin.set_state(state);
-        pin.update_bank()?;
+        let _ = pin.set_state_async(state).await;
+        pin.update_bank().await?;
         Ok(pin)
     }
 }
 
-impl<'a, B, RESET, R> RefreshableInputPin for Pin<'a, B, RESET, R, Input, RefreshMode>
+impl<'a, I2CT, RESET, RAWMUTEX> RefreshableInputPin for Pin<'a, I2CT, RESET, RAWMUTEX, Input, RefreshMode>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
+    RAWMUTEX: RawMutex,
 {
-    type Error = RefreshInputError<B>;
+    type Error = RefreshInputError<I2CT>;
 
     /// Refreshes the input state of all pins of the same bank
-    fn refresh_bank(&self) -> Result<(), Self::Error> {
-        self.refresh(self.bank)
+    async fn refresh_bank(&self) -> Result<(), Self::Error> {
+        self.refresh(self.bank).await
     }
 
     /// Refreshes the input state of all pins (on all banks)
-    fn refresh_all(&self) -> Result<(), Self::Error> {
-        self.refresh(Bank::Bank0)?;
-        self.refresh(Bank::Bank1)
+    async fn refresh_all(&self) -> Result<(), Self::Error> {
+        self.refresh(Bank::Bank0).await?;
+        self.refresh(Bank::Bank1).await
     }
 }
 
-impl<'a, B, RESET, R> RefreshableOutputPin for Pin<'a, B, RESET, R, Output, RefreshMode>
+impl<'a, I2CT, RESET, RAWMUTEX> RefreshableOutputPin for Pin<'a, I2CT, RESET, RAWMUTEX, Output, RefreshMode>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
+    RAWMUTEX: RawMutex,
 {
-    type Error = B::Error;
+    type Error = I2CT::Error;
 
     /// Updates the output state of all pins of the same bank
-    fn update_bank(&self) -> Result<(), Self::Error> {
-        self.update(self.bank)
+    async fn update_bank(&self) -> Result<(), Self::Error> {
+        self.update(self.bank).await
     }
 
     /// Updates the output state of all pins (on all banks)
-    fn update_all(&self) -> Result<(), Self::Error> {
-        self.update(Bank::Bank0)?;
-        self.update(Bank::Bank1)
+    async fn update_all(&self) -> Result<(), Self::Error> {
+        self.update(Bank::Bank0).await?;
+        self.update(Bank::Bank1).await
     }
 }
 
-impl<'a, B, RESET, R> Pin<'a, B, RESET, R, Output, RefreshMode>
+impl<'a, I2CT, RESET, RAWMUTEX> Pin<'a, I2CT, RESET, RAWMUTEX, Output, RefreshMode>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
+    RAWMUTEX: RawMutex,
 {
     /// Writes the output state of the given bank
-    fn update(&self, bank: Bank) -> Result<(), B::Error> {
-        let mut result = Ok(());
-
-        self.expander.access(|expander| {
-            let fut = expander.write_output_state(bank);
-            result = embassy_futures::block_on(fut);
-        });
-
-        result
+    async fn update(&self, bank: Bank) -> Result<(), I2CT::Error> {
+        let mut expander = self.expander.lock().await;
+        expander.as_mut().unwrap().write_output_state(bank).await
     }
 }
 
-impl<'a, B, RESET, R> ErrorType for Pin<'a, B, RESET, R, Input, RefreshMode>
-    where
-        B: I2c,
-        RESET: OutputPin,
-        R: RefGuard<B, RESET> {
+impl<'a, I2CT, RESET, RAWMUTEX> digital_hal_async::ErrorType for Pin<'a, I2CT, RESET, RAWMUTEX, Input, RefreshMode>
+where
+    I2CT: I2c,
+    RESET: OutputPin,
+    RAWMUTEX: RawMutex,
+{
     type Error = Infallible;
 }
 
-impl<'a, B, RESET, R> InputPin for Pin<'a, B, RESET, R, Input, RefreshMode>
+impl<'a, I2CT, RESET, RAWMUTEX> digital::ErrorType for Pin<'a, I2CT, RESET, RAWMUTEX, Input, RefreshMode>
+    where
+        I2CT: I2c,
+        RESET: OutputPin,
+        RAWMUTEX: RawMutex,
+{
+    type Error = Infallible;
+}
+
+
+impl<'a, I2CT, RESET, RAWMUTEX> InputPinAsync for Pin<'a, I2CT, RESET, RAWMUTEX, Input, RefreshMode>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
+    RAWMUTEX: RawMutex,
+{
+
+    async fn is_high_async(&mut self) -> Result<bool, Self::Error> {
+        let mut expander = self.expander.lock().await;
+        Ok(expander.as_mut().unwrap().is_pin_input_high(self.bank, self.id))
+    }
+
+    async fn is_low_async(&mut self) -> Result<bool, Self::Error> {
+        Ok(!self.is_high_async().await?)
+    }
+}
+
+impl<'a, I2CT, RESET, RAWMUTEX> InputPin for Pin<'a, I2CT, RESET, RAWMUTEX, Input, RefreshMode>
+    where
+        I2CT: I2c,
+        RESET: OutputPin,
+        RAWMUTEX: RawMutex,
 {
 
     fn is_high(&mut self) -> Result<bool, Self::Error> {
-        let mut state = false;
-
-        self.expander.access(|expander| {
-            state = expander.is_pin_input_high(self.bank, self.id);
-        });
-
-        Ok(state)
+        embassy_futures::block_on(self.is_high_async())
     }
 
     fn is_low(&mut self) -> Result<bool, Self::Error> {
@@ -180,20 +192,49 @@ where
     }
 }
 
-impl<'a, B, RESET, R> ErrorType for Pin<'a, B, RESET, R, Output, RefreshMode>
-    where
-        B: I2c,
-        RESET: OutputPin,
-        R: RefGuard<B, RESET>,
+impl<'a, I2CT, RESET, RAWMUTEX> digital_hal_async::ErrorType for Pin<'a, I2CT, RESET, RAWMUTEX, Output, RefreshMode>
+where
+    I2CT: I2c,
+    RESET: OutputPin,
+    RAWMUTEX: RawMutex,
 {
     type Error = Infallible;
 }
 
-impl<'a, B, RESET, R> OutputPin for Pin<'a, B, RESET, R, Output, RefreshMode>
+impl<'a, I2CT, RESET, RAWMUTEX> digital::ErrorType for Pin<'a, I2CT, RESET, RAWMUTEX, Output, RefreshMode>
+    where
+        I2CT: I2c,
+        RESET: OutputPin,
+        RAWMUTEX: RawMutex,
+{
+    type Error = Infallible;
+}
+
+impl<'a, I2CT, RESET, RAWMUTEX> OutputPinAsync for Pin<'a, I2CT, RESET, RAWMUTEX, Output, RefreshMode>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>,
+    RAWMUTEX: RawMutex,
+{
+    async fn set_low_async(&mut self) -> Result<(), Self::Error> {
+        self.set_state_async(PinState::Low).await
+    }
+
+    async fn set_high_async(&mut self) -> Result<(), Self::Error> {
+        self.set_state_async(PinState::High).await
+    }
+
+    async fn set_state_async(&mut self, state: PinState) -> Result<(), Self::Error> {
+        let mut expander = self.expander.lock().await;
+        Ok(expander.as_mut().unwrap().set_state(self.bank, self.id, state == PinState::High))
+    }
+}
+
+impl<'a, I2CT, RESET, RAWMUTEX> OutputPin for Pin<'a, I2CT, RESET, RAWMUTEX, Output, RefreshMode>
+    where
+        I2CT: I2c,
+        RESET: OutputPin,
+        RAWMUTEX: RawMutex,
 {
     fn set_low(&mut self) -> Result<(), Self::Error> {
         self.set_state(PinState::Low)
@@ -204,25 +245,21 @@ where
     }
 
     fn set_state(&mut self, state: PinState) -> Result<(), Self::Error> {
-        self.expander.access(|expander| {
-            expander.set_state(self.bank, self.id, state == PinState::High);
-        });
-
-        Ok(())
+        embassy_futures::block_on(self.set_state_async(state))
     }
 }
 
-impl<'a, B, RESET, R> StatefulOutputPin for Pin<'a, B, RESET, R, Output, RefreshMode>
+impl<'a, I2CT, RESET, RAWMUTEX> StatefulOutputPin for Pin<'a, I2CT, RESET, RAWMUTEX, Output, RefreshMode>
 where
-    B: I2c,
+    I2CT: I2c,
     RESET: OutputPin,
-    R: RefGuard<B, RESET>
+    RAWMUTEX: RawMutex
 {
     fn is_set_high(&mut self) -> Result<bool, Self::Error> {
-        Ok(self.is_pin_output_high())
+        Ok(embassy_futures::block_on(self.is_pin_output_high()))
     }
 
     fn is_set_low(&mut self) -> Result<bool, Self::Error> {
-        Ok(!self.is_pin_output_high())
+        Ok(!self.is_set_high()?)
     }
 }
