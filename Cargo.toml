@@ -19,7 +19,7 @@ cortex-m = { version = "0.7.4", optional = true }
 spin = { version = "0.9.8", optional = true }
 heapless = "0.8.0"
 embassy-futures = "0.1"
-embassy-sync = "0.5"
+embassy-sync = "0.6"
 
 [dev-dependencies]
 mockall = "0.11.0"
